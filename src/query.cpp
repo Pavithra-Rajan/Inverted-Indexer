@@ -1,10 +1,14 @@
+#include "tokenizer.hpp"
 #include "varbyte.hpp"
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
+#include <queue>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -12,6 +16,8 @@
 using Clock = std::chrono::steady_clock;
 
 static const uint32_t MAX_DOCID = UINT32_MAX;
+static const double K1 = 1.2, B = 0.75;
+static const size_t TOP_K = 10;
 
 struct LexEntry {
     uint64_t offset;
@@ -40,6 +46,9 @@ struct Index {
     uint32_t num_docs = 0;
     double avg_doc_len = 0;
 };
+
+using Result = std::pair<double, uint32_t>;
+using TopK = std::priority_queue<Result, std::vector<Result>, std::greater<Result>>;
 
 static double seconds_since(Clock::time_point start) {
     return std::chrono::duration<double>(Clock::now() - start).count();
@@ -151,6 +160,128 @@ static uint32_t getFreq(ListPointer &lp) {
     return lp.freqs[lp.pos];
 }
 
+static double bm25(const Index &idx, ListPointer &lp, uint32_t docid) {
+    double freq = getFreq(lp);
+    double norm = K1 * ((1 - B) + B * idx.doc_lengths[docid] / idx.avg_doc_len);
+    return lp.idf * freq * (K1 + 1) / (freq + norm);
+}
+
+static void offer(TopK &top, double score, uint32_t docid) {
+    if (top.size() < TOP_K) {
+        top.emplace(score, docid);
+    } else if (score > top.top().first) {
+        top.pop();
+        top.emplace(score, docid);
+    }
+}
+
+static void conjunctive(const Index &idx, std::vector<ListPointer> &lists, TopK &top) {
+    // Shortest list drives, so the longer lists are only probed with nextGEQ.
+    std::sort(lists.begin(), lists.end(),
+              [](const ListPointer &a, const ListPointer &b) { return a.df < b.df; });
+
+    uint32_t did = 0;
+    while (true) {
+        did = nextGEQ(lists[0], did);
+        if (did == MAX_DOCID) break;
+
+        uint32_t d = did;
+        for (size_t i = 1; i < lists.size() && d == did; i++) d = nextGEQ(lists[i], did);
+        if (d == MAX_DOCID) break;
+        if (d > did) {
+            did = d;
+            continue;
+        }
+
+        double score = 0;
+        for (auto &lp : lists) score += bm25(idx, lp, did);
+        offer(top, score, did);
+        did++;
+    }
+}
+
+static void disjunctive(const Index &idx, std::vector<ListPointer> &lists, TopK &top) {
+    std::vector<uint32_t> cur(lists.size());
+    for (size_t i = 0; i < lists.size(); i++) cur[i] = nextGEQ(lists[i], 0);
+
+    while (true) {
+        uint32_t did = *std::min_element(cur.begin(), cur.end());
+        if (did == MAX_DOCID) break;
+
+        double score = 0;
+        for (size_t i = 0; i < lists.size(); i++) {
+            if (cur[i] != did) continue;
+            score += bm25(idx, lists[i], did);
+            cur[i] = nextGEQ(lists[i], did + 1);
+        }
+        offer(top, score, did);
+    }
+}
+
+// Same tokenizer as the parser; repeated query terms count once.
+static std::vector<std::string> query_terms(const std::string &query) {
+    std::vector<std::string> terms;
+    tokenize(query, terms);
+    std::sort(terms.begin(), terms.end());
+    terms.erase(std::unique(terms.begin(), terms.end()), terms.end());
+    return terms;
+}
+
+// Returns the top results, best first.
+static std::vector<Result> run_query(Index &idx, const std::vector<std::string> &terms, bool conj) {
+    std::vector<ListPointer> lists;
+    bool missing = false;
+    for (auto &term : terms) {
+        auto it = idx.lexicon.find(term);
+        if (it == idx.lexicon.end()) {
+            missing = true;
+            continue;
+        }
+        lists.push_back(openList(idx, it->second));
+    }
+
+    // A term absent from the lexicon empties an AND query; an OR query just ignores it.
+    TopK top;
+    if (!lists.empty() && !(conj && missing)) {
+        if (conj) conjunctive(idx, lists, top);
+        else disjunctive(idx, lists, top);
+    }
+    for (auto &lp : lists) closeList(lp);
+
+    std::vector<Result> results;
+    for (; !top.empty(); top.pop()) results.push_back(top.top());
+    std::reverse(results.begin(), results.end());
+    return results;
+}
+
+static void command_line(Index &idx) {
+    std::string line, mode;
+    while (true) {
+        std::cout << "\nquery> " << std::flush;
+        if (!std::getline(std::cin, line)) break;
+        std::vector<std::string> terms = query_terms(line);
+        if (terms.empty()) continue;
+
+        // Anything other than "c" means disjunctive.
+        std::cout << "mode (c = conjunctive, d = disjunctive)> " << std::flush;
+        if (!std::getline(std::cin, mode)) break;
+        bool conj = !mode.empty() && (mode[0] == 'c' || mode[0] == 'C');
+
+        auto start = Clock::now();
+        std::vector<Result> results = run_query(idx, terms, conj);
+
+        std::cout << std::fixed << std::setprecision(4);
+        if (results.empty()) std::cout << "no results\n";
+        for (size_t i = 0; i < results.size(); i++) {
+            std::cout << std::setw(2) << (i + 1) << ".  score " << results[i].first
+                      << "  passage " << idx.page_table[results[i].second] << '\n';
+        }
+        std::cout << (conj ? "conjunctive" : "disjunctive") << ", "
+                  << (seconds_since(start) * 1000) << " ms\n";
+    }
+    std::cout << '\n';
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
         std::cerr << "usage: " << argv[0] << " <runs_dir> <index_dir>\n";
@@ -167,5 +298,7 @@ int main(int argc, char **argv) {
     std::cerr << std::fixed << std::setprecision(2)
               << "loaded " << idx.lexicon.size() << " terms, " << idx.num_docs << " docs in "
               << seconds_since(load_start) << "s\n";
+
+    command_line(idx);
     return 0;
 }
