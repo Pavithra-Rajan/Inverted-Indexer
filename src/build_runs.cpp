@@ -60,12 +60,14 @@ int main(int argc, char **argv) {
     }
     std::ofstream doc_lengths(out_dir + "/doc_lengths.bin", std::ios::binary);
     std::ofstream page_table(out_dir + "/page_table.bin", std::ios::binary);
+    std::ofstream doc_offsets(out_dir + "/doc_offsets.bin", std::ios::binary);
 
     Postings block;
     size_t block_postings = 0;
     size_t run_index = 0;
     uint64_t total_tokens = 0;
     uint32_t doc_id = 0;
+    uint64_t line_offset = 0;
 
     auto program_start = Clock::now();
     auto block_start = program_start;
@@ -75,6 +77,10 @@ int main(int argc, char **argv) {
     std::unordered_map<std::string, uint32_t> local_freq;
 
     while (std::getline(in, line)) {
+
+        // Byte offset of this line in the collection, so the query processor can seek to the passage text.
+        doc_offsets.write((char *)&line_offset, sizeof(line_offset));
+        line_offset += line.size() + 1;
 
         // 1. Read each line of the collection
         size_t tabIndex = line.find('\t');

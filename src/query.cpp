@@ -10,6 +10,7 @@
 #include <iostream>
 #include <queue>
 #include <string>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
@@ -18,6 +19,7 @@ using Clock = std::chrono::steady_clock;
 static const uint32_t MAX_DOCID = UINT32_MAX;
 static const double K1 = 1.2, B = 0.75;
 static const size_t TOP_K = 10;
+static const size_t SNIPPET_WORDS = 25;
 
 struct LexEntry {
     uint64_t offset;
@@ -40,11 +42,17 @@ struct ListPointer {
 };
 
 struct Index {
-    std::ifstream index_in;
+    std::ifstream index_in, collection_in;
     std::unordered_map<std::string, LexEntry> lexicon;
     std::vector<uint32_t> page_table, doc_lengths;
+    std::vector<uint64_t> doc_offsets;
     uint32_t num_docs = 0;
     double avg_doc_len = 0;
+};
+
+// How matched terms are marked in a snippet: ANSI bold in the terminal.
+struct Markup {
+    const char *open, *close;
 };
 
 using Result = std::pair<double, uint32_t>;
@@ -166,6 +174,71 @@ static double bm25(const Index &idx, ListPointer &lp, uint32_t docid) {
     return lp.idf * freq * (K1 + 1) / (freq + norm);
 }
 
+// Passage text is read from the original collection by seeking; it is never held in memory.
+static std::string passage_text(Index &idx, uint32_t docid) {
+    std::string line;
+    idx.collection_in.clear();
+    idx.collection_in.seekg((std::streamoff)idx.doc_offsets[docid]);
+    std::getline(idx.collection_in, line);
+    size_t tab = line.find('\t');
+    return tab == std::string::npos ? line : line.substr(tab + 1);
+}
+
+// Picks the SNIPPET_WORDS-word window with the highest sum of idf over distinct query terms;
+// ties go to the window with more query-term occurrences, then to the earliest one.
+static std::string snippet(const std::string &text,
+                           const std::unordered_map<std::string, double> &term_idf,
+                           const Markup &markup, size_t max_words = SNIPPET_WORDS) {
+    std::vector<TokenSpan> toks;
+    tokenize_spans(text, toks);
+    std::string out;
+    if (toks.empty()) {
+        out.append(text, 0, text.size());
+        return out;
+    }
+    size_t n = toks.size(), width = std::min(n, max_words);
+
+    size_t best = 0, best_hits = 0;
+    double best_score = -1;
+    std::vector<const std::string *> seen;
+    for (size_t s = 0; s + width <= n; s++) {
+        double score = 0;
+        size_t hits = 0;
+        seen.clear();
+        for (size_t i = s; i < s + width; i++) {
+            auto it = term_idf.find(toks[i].term);
+            if (it == term_idf.end()) continue;
+            hits++;
+            if (std::find(seen.begin(), seen.end(), &it->first) == seen.end()) {
+                seen.push_back(&it->first);
+                score += it->second;
+            }
+        }
+        // Epsilon because the same terms summed in a different order differ in the last bits.
+        if (score > best_score + 1e-9 || (score > best_score - 1e-9 && hits > best_hits)) {
+            best = s;
+            best_score = score;
+            best_hits = hits;
+        }
+    }
+
+    size_t last = best + width;
+    size_t p = best == 0 ? 0 : toks[best].start;
+    size_t to = last == n ? text.size() : toks[last - 1].end;
+    if (best > 0) out += "... ";
+    for (size_t i = best; i < last; i++) {
+        if (!term_idf.count(toks[i].term)) continue;
+        out.append(text, p, toks[i].start - p);
+        out += markup.open;
+        out.append(text, toks[i].start, toks[i].end - toks[i].start);
+        out += markup.close;
+        p = toks[i].end;
+    }
+    out.append(text, p, to - p);
+    if (last < n) out += " ...";
+    return out;
+}
+
 static void offer(TopK &top, double score, uint32_t docid) {
     if (top.size() < TOP_K) {
         top.emplace(score, docid);
@@ -227,8 +300,9 @@ static std::vector<std::string> query_terms(const std::string &query) {
     return terms;
 }
 
-// Returns the top results, best first.
-static std::vector<Result> run_query(Index &idx, const std::vector<std::string> &terms, bool conj) {
+// Returns the top results, best first, and fills term_idf for the terms found in the lexicon.
+static std::vector<Result> run_query(Index &idx, const std::vector<std::string> &terms, bool conj,
+                                     std::unordered_map<std::string, double> &term_idf) {
     std::vector<ListPointer> lists;
     bool missing = false;
     for (auto &term : terms) {
@@ -238,6 +312,7 @@ static std::vector<Result> run_query(Index &idx, const std::vector<std::string> 
             continue;
         }
         lists.push_back(openList(idx, it->second));
+        term_idf[term] = lists.back().idf;
     }
 
     // A term absent from the lexicon empties an AND query; an OR query just ignores it.
@@ -254,7 +329,11 @@ static std::vector<Result> run_query(Index &idx, const std::vector<std::string> 
     return results;
 }
 
-static void command_line(Index &idx) {
+static void command_line(Index &idx, bool show_text) {
+    // Bold escape codes only when printing to a terminal, to pipe easily to a file.
+    bool tty = isatty(STDOUT_FILENO);
+    Markup markup = {tty ? "\033[1m" : "", tty ? "\033[0m" : ""};
+
     std::string line, mode;
     while (true) {
         std::cout << "\nquery> " << std::flush;
@@ -268,13 +347,18 @@ static void command_line(Index &idx) {
         bool conj = !mode.empty() && (mode[0] == 'c' || mode[0] == 'C');
 
         auto start = Clock::now();
-        std::vector<Result> results = run_query(idx, terms, conj);
+        std::unordered_map<std::string, double> term_idf;
+        std::vector<Result> results = run_query(idx, terms, conj, term_idf);
 
         std::cout << std::fixed << std::setprecision(4);
         if (results.empty()) std::cout << "no results\n";
         for (size_t i = 0; i < results.size(); i++) {
             std::cout << std::setw(2) << (i + 1) << ".  score " << results[i].first
                       << "  passage " << idx.page_table[results[i].second] << '\n';
+            if (show_text) {
+                std::cout << "    " << snippet(passage_text(idx, results[i].second), term_idf, markup)
+                          << "\n\n";
+            }
         }
         std::cout << (conj ? "conjunctive" : "disjunctive") << ", "
                   << (seconds_since(start) * 1000) << " ms\n";
@@ -284,7 +368,7 @@ static void command_line(Index &idx) {
 
 int main(int argc, char **argv) {
     if (argc < 3) {
-        std::cerr << "usage: " << argv[0] << " <runs_dir> <index_dir>\n";
+        std::cerr << "usage: " << argv[0] << " <runs_dir> <index_dir> [collection.tsv]\n";
         return 1;
     }
 
@@ -294,11 +378,20 @@ int main(int argc, char **argv) {
         std::cerr << "cannot load index from " << argv[1] << " and " << argv[2] << "\n";
         return 1;
     }
+    // Passage text is optional: without the collection, results show passage IDs only.
+    bool show_text = false;
+    if (argc > 3) {
+        idx.collection_in.open(argv[3], std::ios::binary);
+        show_text = idx.collection_in &&
+                    read_binary_file(std::string(argv[1]) + "/doc_offsets.bin", idx.doc_offsets) &&
+                    idx.doc_offsets.size() == idx.num_docs;
+        if (!show_text) std::cerr << "cannot read passage text, showing passage IDs only\n";
+    }
 
     std::cerr << std::fixed << std::setprecision(2)
               << "loaded " << idx.lexicon.size() << " terms, " << idx.num_docs << " docs in "
               << seconds_since(load_start) << "s\n";
 
-    command_line(idx);
+    command_line(idx, show_text);
     return 0;
 }
