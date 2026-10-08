@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Passage Search</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<h1>Passage Search</h1>
+<form id="form">
+  <input type="text" id="q" placeholder="Type a query" autofocus>
+  <div class="controls">
+    <label><input type="radio" name="mode" value="d" checked> Disjunctive (OR)</label>
+    <label><input type="radio" name="mode" value="c"> Conjunctive (AND)</label>
+    <button type="submit">Search</button>
+  </div>
+</form>
+<div id="results"></div>
+<script>
+  const form = document.getElementById('form');
+  const input = document.getElementById('q');
+  const results = document.getElementById('results');
+
+  async function search() {
+    const params = new URLSearchParams({ q: input.value, mode: form.elements.mode.value });
+    // Keep the query in the URL so coming back from a passage page restores the results.
+    history.replaceState(null, '', '?' + params);
+    results.textContent = 'Searching...';
+    try {
+      const response = await fetch('/search?' + params);
+      results.innerHTML = await response.text();
+    } catch (error) {
+      results.textContent = 'Could not reach the query server.';
+    }
+  }
+
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    search();
+  });
+
+  const saved = new URLSearchParams(location.search);
+  if (saved.get('q')) {
+    input.value = saved.get('q');
+    form.elements.mode.value = saved.get('mode') === 'c' ? 'c' : 'd';
+    search();
+  }
+</script>
+</body>
+</html>
