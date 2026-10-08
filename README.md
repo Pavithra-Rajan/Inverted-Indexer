@@ -31,7 +31,7 @@ Each line of `collection.tsv` is `pid<TAB>passage text`.
 make
 ```
 
-Compiles `build_runs` and `merge` into `build/`.
+Compiles `build_runs`, `merge`, `query` and `dump_list` into `build/`.
 
 
 ## Run
@@ -62,6 +62,41 @@ mkdir -p data/runs
   index. 
 
 
+# Part 3: query the index
+
+```bash
+./build/query data/runs data data/collection.tsv
+```
+
+Type a query, then `c` (conjunctive) or `d` (disjunctive). Prints the top 10
+passages by BM25 (k1 = 1.2, b = 0.75) with a snippet and waits for the next
+query; Ctrl-D exits. Without the collection path, only passage IDs are shown.
+
+The snippet is the 25-word window of the passage with the highest total idf
+of distinct query terms.
+
+
+# Browser interface
+
+```bash
+./build/query data/runs data data/collection.tsv 8080
+```
+
+Adding a port serves `web/index.html` at http://localhost:8080 instead of the
+command-line prompt (run from the repo root). Clicking a
+result's passage ID opens the full passage.
+
+
+# Debugging: print one term's inverted list in ASCII
+
+```bash
+./build/dump_list data manhattan | head
+```
+
+Prints `#` header lines (list and per-block metadata), then one
+`docID<TAB>freq` per line.
+
+
 ## What `build_runs` does
 
 Reads `collection.tsv` **once**, line by line (never loading the whole
@@ -83,6 +118,7 @@ This repeats until the collection is exhausted. A final `stats.txt`
 records total docs, total tokens, and how many runs were produced.
 
 **Output:** `run_0.txt ... run_N.txt`, `doc_lengths.bin`, `page_table.bin`,
+`doc_offsets.bin` (byte offset of each passage in `collection.tsv`, 8 bytes/doc),
 `stats.txt`.
 
 ## What `merge` does
