@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -15,9 +16,9 @@ static double seconds_since(Clock::time_point start) {
     return std::chrono::duration<double>(Clock::now() - start).count();
 }
 
-// Returns the number of runs from the stats.txt file in the given directory.
-static size_t read_num_runs(const std::string &runs_dir) {
-    std::ifstream stats(runs_dir + "/stats.txt");
+// Returns the number of runs from the given stats.txt file.
+static size_t read_num_runs(const std::string &stats_path) {
+    std::ifstream stats(stats_path);
     std::string key;
     uint64_t value;
     while (stats >> key >> value) {
@@ -143,10 +144,13 @@ int main(int argc, char **argv) {
     std::string out_dir = argv[2];
     size_t block_size = argc > 3 ? std::stoul(argv[3]) : 128;
 
+    // build_runs writes a copy of stats.txt next to the run files.
+    std::string stats_path = runs_dir + "/stats.txt";
+
     // Find number of runs from stats.txt
-    size_t num_runs = read_num_runs(runs_dir);
+    size_t num_runs = read_num_runs(stats_path);
     if (num_runs == 0) {
-        std::cerr << "no runs found (check " << runs_dir << "/stats.txt)\n";
+        std::cerr << "no runs found (check " << stats_path << ")\n";
         return 1;
     }
 
@@ -166,6 +170,14 @@ int main(int argc, char **argv) {
     std::priority_queue<HeapItem, std::vector<HeapItem>, HeapCmp> heap;
     for (size_t i = 0; i < num_runs; i++)
         if (readers[i].next_group()) heap.push({readers[i].cur_term, i});
+
+    // Create the output directory (and any missing parents) if it doesn't exist yet.
+    std::error_code ec;
+    std::filesystem::create_directories(out_dir, ec);
+    if (ec) {
+        std::cerr << "cannot create " << out_dir << ": " << ec.message() << "\n";
+        return 1;
+    }
 
     //opening the output files for the merged index and lexicon
     std::ofstream index_out(out_dir + "/index.bin", std::ios::binary);

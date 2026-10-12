@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -28,8 +29,8 @@ static void flush_run(Postings &block, size_t block_postings, size_t run_index,
     for (auto &kv : block) terms.push_back(kv.first);
     std::sort(terms.begin(), terms.end());
 
-    // 2. 
-    std::ofstream out(out_dir + "/run_" + std::to_string(run_index) + ".txt");
+
+    std::ofstream out(out_dir + "/runs/run_" + std::to_string(run_index) + ".txt");
     for (auto &term : terms) {
         for (auto &posting : block[term]) {
             out << term << '\t' << posting.first << '\t' << posting.second << '\n';
@@ -58,6 +59,15 @@ int main(int argc, char **argv) {
         std::cerr << "cannot open " << collection_path << "\n";
         return 1;
     }
+
+    // Create out_dir/runs (and out_dir itself) if they don't exist yet
+    std::error_code ec;
+    std::filesystem::create_directories(out_dir + "/runs", ec);
+    if (ec) {
+        std::cerr << "cannot create " << out_dir << "/runs: " << ec.message() << "\n";
+        return 1;
+    }
+
     std::ofstream doc_lengths(out_dir + "/doc_lengths.bin", std::ios::binary);
     std::ofstream page_table(out_dir + "/page_table.bin", std::ios::binary);
     std::ofstream doc_offsets(out_dir + "/doc_offsets.bin", std::ios::binary);
@@ -82,7 +92,7 @@ int main(int argc, char **argv) {
         doc_offsets.write((char *)&line_offset, sizeof(line_offset));
         line_offset += line.size() + 1;
 
-        // 1. Read each line of the collection
+        // 1. Separate the passage id and the text using the tab character
         size_t tabIndex = line.find('\t');
         const std::string &text = (tabIndex == std::string::npos) ? line : line.substr(tabIndex + 1);
 
@@ -129,7 +139,8 @@ int main(int argc, char **argv) {
         flush_run(block, block_postings, run_index++, out_dir, block_start);
     }
 
-    std::ofstream stats(out_dir + "/stats.txt");
+    // Stats go next to the run files; merge and query both read them from out_dir/runs.
+    std::ofstream stats(out_dir + "/runs/stats.txt");
     stats << "num_docs\t" << doc_id << '\n';
     stats << "total_tokens\t" << total_tokens << '\n';
     stats << "num_runs\t" << run_index << '\n';

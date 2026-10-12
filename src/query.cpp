@@ -61,7 +61,10 @@ struct Markup {
     bool html;
 };
 
+// stores (score, docid)
 using Result = std::pair<double, uint32_t>;
+
+// min-heap ordered by score
 using TopK = std::priority_queue<Result, std::vector<Result>, std::greater<Result>>;
 
 static double seconds_since(Clock::time_point start) {
@@ -79,7 +82,7 @@ static bool read_binary_file(const std::string &path, std::vector<T> &out) {
 }
 
 static bool load_index(Index &idx, const std::string &runs_dir, const std::string &index_dir) {
-    std::ifstream stats(runs_dir + "/stats.txt");
+    std::ifstream stats(runs_dir + "/runs/stats.txt");
     std::string key;
     uint64_t value, total_tokens = 0;
     while (stats >> key >> value) {
@@ -357,6 +360,7 @@ static void command_line(Index &idx, bool show_text) {
 
     std::string line, mode;
     while (true) {
+        // Get query from user 
         std::cout << "\nquery> " << std::flush;
         if (!std::getline(std::cin, line)) break;
         std::vector<std::string> terms = query_terms(line);

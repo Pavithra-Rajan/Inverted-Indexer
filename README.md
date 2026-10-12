@@ -36,14 +36,10 @@ Compiles `build_runs`, `merge`, `query` and `dump_list` into `build/`.
 
 ## Run
 
-```bash
-mkdir -p data/runs
-```
-
 # Part 1: parse collection.tsv -> sorted intermediate runs
 
 ```bash
-./build/build_runs "../collection.tsv" data/runs 40000000
+./build/build_runs "../collection.tsv" data 40000000
 ```
 
 - "../collection.tsv" points path to collection.
@@ -65,7 +61,7 @@ mkdir -p data/runs
 # Part 3: query the index
 
 ```bash
-./build/query data/runs data data/collection.tsv
+./build/query data data data/collection.tsv
 ```
 
 Type a query, then `c` (conjunctive) or `d` (disjunctive). Prints the top 10
@@ -79,7 +75,7 @@ of distinct query terms.
 # Browser interface
 
 ```bash
-./build/query data/runs data data/collection.tsv 8080
+./build/query data data data/collection.tsv 8080
 ```
 
 Adding a port serves `web/index.html` at http://localhost:8080 instead of the
