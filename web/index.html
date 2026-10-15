@@ -12,9 +12,7 @@
   <input type="text" id="q" placeholder="Type a query" autofocus>
   <div class="controls">
     <label><input type="radio" name="mode" value="d" checked> Disjunctive (OR)</label>
-    <label><input type="radio" name="mode" value="c"> Conjunctive (AND)</label>
-    <button type="submit">Search</button>
-  </div>
+    <label><input type="radio" name="mode" value="c"> Conjunctive (AND)</label>  </div>
 </form>
 <div id="results"></div>
 <script>
@@ -39,6 +37,11 @@
     event.preventDefault();
     search();
   });
+
+  // Switching mode reruns the current query right away.
+  for (const radio of form.elements.mode) {
+    radio.addEventListener('change', () => { if (input.value.trim()) search(); });
+  }
 
   const saved = new URLSearchParams(location.search);
   if (saved.get('q')) {

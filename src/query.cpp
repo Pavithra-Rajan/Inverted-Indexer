@@ -38,6 +38,7 @@ struct BlockMeta {
 struct ListPointer {
     uint32_t df = 0;
     double idf = 0;
+    size_t term = 0;  // position in the query, since conjunctive reorders the lists
     std::vector<BlockMeta> blocks;
     std::vector<uint8_t> docid_data, freq_data;  // whole list, still compressed
     std::vector<uint32_t> docids, freqs;         // current block only, decompressed
@@ -61,11 +62,19 @@ struct Markup {
     bool html;
 };
 
-// stores (score, docid)
-using Result = std::pair<double, uint32_t>;
+struct Result {
+    double score;
+    uint32_t docid;
+    std::vector<double> term_scores;  // one per query term, 0 if the term is not in the doc
+};
 
-// min-heap ordered by score
-using TopK = std::priority_queue<Result, std::vector<Result>, std::greater<Result>>;
+// Min-heap on (score, docid), so the weakest of the top results sits on top.
+struct WorseFirst {
+    bool operator()(const Result &a, const Result &b) const {
+        return a.score != b.score ? a.score > b.score : a.docid > b.docid;
+    }
+};
+using TopK = std::priority_queue<Result, std::vector<Result>, WorseFirst>;
 
 static double seconds_since(Clock::time_point start) {
     return std::chrono::duration<double>(Clock::now() - start).count();
@@ -263,21 +272,21 @@ static std::string snippet(const std::string &text,
     return out;
 }
 
-static void offer(TopK &top, double score, uint32_t docid) {
+static void offer(TopK &top, double score, uint32_t docid, const std::vector<double> &term_scores) {
     if (top.size() < TOP_K) {
-        top.emplace(score, docid);
-    } else if (score > top.top().first) {
+        top.push({score, docid, term_scores});
+    } else if (score > top.top().score) {
         top.pop();
-        top.emplace(score, docid);
+        top.push({score, docid, term_scores});
     }
 }
 
-// Query where all terms are required in the document (AND)
-static void conjunctive(const Index &idx, std::vector<ListPointer> &lists, TopK &top) {
+static void conjunctive(const Index &idx, std::vector<ListPointer> &lists, size_t num_terms, TopK &top) {
     // Shortest list drives, so the longer lists are only probed with nextGEQ.
     std::sort(lists.begin(), lists.end(),
               [](const ListPointer &a, const ListPointer &b) { return a.df < b.df; });
 
+    std::vector<double> term_scores(num_terms);
     uint32_t did = 0;
     while (true) {
         did = nextGEQ(lists[0], did);
@@ -292,19 +301,14 @@ static void conjunctive(const Index &idx, std::vector<ListPointer> &lists, TopK 
         }
 
         double score = 0;
-
-        // total score for document did is the sum of the BM25 score over all the terms
-        for (auto &lp : lists) score += bm25(idx, lp, did);
-
-        // offer the document along with its score to heap
-        offer(top, score, did);
-
+        for (auto &lp : lists) score += term_scores[lp.term] = bm25(idx, lp, did);
+        offer(top, score, did, term_scores);
         did++;
     }
 }
 
-// Query where all terms are not required in the document (OR)
-static void disjunctive(const Index &idx, std::vector<ListPointer> &lists, TopK &top) {
+static void disjunctive(const Index &idx, std::vector<ListPointer> &lists, size_t num_terms, TopK &top) {
+    std::vector<double> term_scores(num_terms);
     std::vector<uint32_t> cur(lists.size());
     for (size_t i = 0; i < lists.size(); i++) cur[i] = nextGEQ(lists[i], 0);
 
@@ -313,12 +317,13 @@ static void disjunctive(const Index &idx, std::vector<ListPointer> &lists, TopK 
         if (did == MAX_DOCID) break;
 
         double score = 0;
+        std::fill(term_scores.begin(), term_scores.end(), 0.0);
         for (size_t i = 0; i < lists.size(); i++) {
             if (cur[i] != did) continue;
-            score += bm25(idx, lists[i], did);
+            score += term_scores[lists[i].term] = bm25(idx, lists[i], did);
             cur[i] = nextGEQ(lists[i], did + 1);
         }
-        offer(top, score, did);
+        offer(top, score, did, term_scores);
     }
 }
 
@@ -336,21 +341,22 @@ static std::vector<Result> run_query(Index &idx, const std::vector<std::string> 
                                      std::unordered_map<std::string, double> &term_idf) {
     std::vector<ListPointer> lists;
     bool missing = false;
-    for (auto &term : terms) {
-        auto it = idx.lexicon.find(term);
+    for (size_t i = 0; i < terms.size(); i++) {
+        auto it = idx.lexicon.find(terms[i]);
         if (it == idx.lexicon.end()) {
             missing = true;
             continue;
         }
         lists.push_back(openList(idx, it->second));
-        term_idf[term] = lists.back().idf;
+        lists.back().term = i;
+        term_idf[terms[i]] = lists.back().idf;
     }
 
     // A term absent from the lexicon empties an AND query; an OR query just ignores it.
     TopK top;
     if (!lists.empty() && !(conj && missing)) {
-        if (conj) conjunctive(idx, lists, top);
-        else disjunctive(idx, lists, top);
+        if (conj) conjunctive(idx, lists, terms.size(), top);
+        else disjunctive(idx, lists, terms.size(), top);
     }
     for (auto &lp : lists) closeList(lp);
 
@@ -393,12 +399,13 @@ static void command_line(Index &idx, bool show_text) {
         if (results.empty()) std::cout << "no results\n";
 
         for (size_t i = 0; i < results.size(); i++) {
-            std::cout << std::setw(2) << (i + 1) << ".  score " << results[i].first
-                      << "  passage " << idx.page_table[results[i].second] << '\n';
-            if (show_text) {
-                std::cout << "    " << snippet(passage_text(idx, results[i].second), term_idf, markup)
-                          << "\n\n";
-            }
+            const Result &r = results[i];
+            std::cout << std::setw(2) << (i + 1) << ".  score " << r.score << "  passage "
+                      << idx.page_table[r.docid] << "\n    ";
+            for (size_t t = 0; t < terms.size(); t++) std::cout << terms[t] << " " << r.term_scores[t] << "  ";
+            std::cout << '\n';
+            if (show_text) std::cout << "    " << snippet(passage_text(idx, r.docid), term_idf, markup) << '\n';
+            std::cout << '\n';
         }
 
         // Printing stats 
@@ -455,10 +462,12 @@ static std::string search_html(Index &idx, const std::string &query, bool conj, 
     out << "<ol>";
     for (auto &r : results) {
         out << "<li><div class=\"head\">";
-        if (show_text) out << "<a href=\"/passage?doc=" << r.second << "&q=" << q << "\">";
-        out << "passage " << idx.page_table[r.second] << (show_text ? "</a>" : "") << " &middot; score "
-            << std::setprecision(4) << r.first << "</div>";
-        if (show_text) out << "<div>" << snippet(passage_text(idx, r.second), term_idf, markup) << "</div>";
+        if (show_text) out << "<a href=\"/passage?doc=" << r.docid << "&q=" << q << "\">";
+        out << "passage " << idx.page_table[r.docid] << (show_text ? "</a>" : "") << " &middot; score "
+            << std::setprecision(4) << r.score << "</div><div class=\"terms\">";
+        for (size_t t = 0; t < terms.size(); t++) out << "<span>" << terms[t] << " " << r.term_scores[t] << "</span>";
+        out << "</div>";
+        if (show_text) out << "<div>" << snippet(passage_text(idx, r.docid), term_idf, markup) << "</div>";
         out << "</li>";
     }
     out << "</ol><p class=\"meta\">" << (conj ? "conjunctive" : "disjunctive") << ", "
