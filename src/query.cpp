@@ -272,6 +272,7 @@ static void offer(TopK &top, double score, uint32_t docid) {
     }
 }
 
+// Query where all terms are required in the document (AND)
 static void conjunctive(const Index &idx, std::vector<ListPointer> &lists, TopK &top) {
     // Shortest list drives, so the longer lists are only probed with nextGEQ.
     std::sort(lists.begin(), lists.end(),
@@ -291,12 +292,18 @@ static void conjunctive(const Index &idx, std::vector<ListPointer> &lists, TopK 
         }
 
         double score = 0;
+
+        // total score for document did is the sum of the BM25 score over all the terms
         for (auto &lp : lists) score += bm25(idx, lp, did);
+
+        // offer the document along with its score to heap
         offer(top, score, did);
+
         did++;
     }
 }
 
+// Query where all terms are not required in the document (OR)
 static void disjunctive(const Index &idx, std::vector<ListPointer> &lists, TopK &top) {
     std::vector<uint32_t> cur(lists.size());
     for (size_t i = 0; i < lists.size(); i++) cur[i] = nextGEQ(lists[i], 0);
@@ -347,6 +354,7 @@ static std::vector<Result> run_query(Index &idx, const std::vector<std::string> 
     }
     for (auto &lp : lists) closeList(lp);
 
+    // Return results from heap in reverse order (greatest -> least scored)
     std::vector<Result> results;
     for (; !top.empty(); top.pop()) results.push_back(top.top());
     std::reverse(results.begin(), results.end());
@@ -363,20 +371,27 @@ static void command_line(Index &idx, bool show_text) {
         // Get query from user 
         std::cout << "\nquery> " << std::flush;
         if (!std::getline(std::cin, line)) break;
+
+        // Get query as a list of unique tokens
         std::vector<std::string> terms = query_terms(line);
         if (terms.empty()) continue;
 
-        // Anything other than "c" means disjunctive.
+        // Prompt for mode. Anything other than "c" means disjunctive.
         std::cout << "mode (c = conjunctive, d = disjunctive)> " << std::flush;
         if (!std::getline(std::cin, mode)) break;
         bool conj = !mode.empty() && (mode[0] == 'c' || mode[0] == 'C');
 
+
         auto start = Clock::now();
         std::unordered_map<std::string, double> term_idf;
+
+        // Run the query to find close matches using the index
         std::vector<Result> results = run_query(idx, terms, conj, term_idf);
 
+        //Printing results
         std::cout << std::fixed << std::setprecision(4);
         if (results.empty()) std::cout << "no results\n";
+
         for (size_t i = 0; i < results.size(); i++) {
             std::cout << std::setw(2) << (i + 1) << ".  score " << results[i].first
                       << "  passage " << idx.page_table[results[i].second] << '\n';
@@ -385,6 +400,8 @@ static void command_line(Index &idx, bool show_text) {
                           << "\n\n";
             }
         }
+
+        // Printing stats 
         std::cout << (conj ? "conjunctive" : "disjunctive") << ", "
                   << (seconds_since(start) * 1000) << " ms\n";
     }
