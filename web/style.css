@@ -1,6 +1,6 @@
 body { font-family: system-ui, sans-serif; max-width: 760px; margin: 40px auto; padding: 0 16px; line-height: 1.5; }
 input[type=text] { width: 100%; box-sizing: border-box; padding: 8px; font-size: 16px; }
 .controls { margin: 10px 0 20px; }
-button { padding: 6px 16px; font-size: 15px; margin-left: 12px; }
 li { margin-bottom: 14px; }
-.head, .meta { color: #666; font-size: 13px; }
+.head, .meta, .terms { color: #666; font-size: 13px; }
+.terms span { margin-right: 14px; }
